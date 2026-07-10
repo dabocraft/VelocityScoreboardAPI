@@ -25,12 +25,12 @@ jobs:
         run: chmod +x gradlew
 
       - name: Build with Gradle
-        run: ./gradlew shadowJar --no-daemon
+        run: ./gradlew :plugin:shadowJar --no-daemon
 
       - name: Upload plugin JAR
         uses: actions/upload-artifact@v4
         with:
           name: velocity-scoreboard-api
-          path: "build/libs/*.jar"
+          path: "plugin/build/libs/*.jar"
           if-no-files-found: error
           retention-days: 30
