@@ -1,0 +1,263 @@
+/*
+ * This file is part of VelocityScoreboardAPI, licensed under the Apache License 2.0.
+ *
+ *  Copyright (c) William278 <will27528@gmail.com>
+ *  Copyright (c) NEZNAMY <n.e.z.n.a.m.y@azet.sk>
+ *  Copyright (c) contributors
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+package com.velocitypowered.proxy.data;
+
+import com.velocitypowered.api.proxy.Player;
+import com.velocitypowered.api.scoreboard.ProxyObjective;
+import com.velocitypowered.api.scoreboard.ScoreboardManager;
+import com.velocitypowered.proxy.connection.MinecraftSessionHandler;
+import com.velocitypowered.proxy.connection.backend.BackendPlaySessionHandler;
+import com.velocitypowered.proxy.connection.backend.VelocityServerConnection;
+import com.velocitypowered.proxy.protocol.packet.scoreboard.*;
+import com.velocitypowered.proxy.scoreboard.*;
+import com.velocitypowered.proxy.scoreboard.downstream.DownstreamScoreboard;
+import lombok.NonNull;
+import org.jetbrains.annotations.NotNull;
+
+import java.lang.reflect.Field;
+
+/**
+ * This class handles outgoing scoreboard packets, allowing to cancel them.
+ * If Scoreboard API gets merged into Velocity, content of this class will be moved to
+ * {@link MinecraftSessionHandler} class.
+ */
+public class PacketHandler {
+
+    /** Server connection field, because it is private. Resolved once at class-load time. */
+    private static final Field serverConn;
+
+    static {
+        // Try known field names used across different Velocity 3.x snapshot builds
+        Field resolved = null;
+        String[] candidates = {"serverConn", "connection", "serverConnection", "velocityServerConnection"};
+        for (String name : candidates) {
+            try {
+                Field f = BackendPlaySessionHandler.class.getDeclaredField(name);
+                // Verify the field type is compatible (VelocityServerConnection or a supertype)
+                if (VelocityServerConnection.class.isAssignableFrom(f.getType())) {
+                    f.setAccessible(true);
+                    resolved = f;
+                    break;
+                }
+            } catch (NoSuchFieldException ignored) {}
+        }
+        // Last-resort: scan all fields for a VelocityServerConnection-typed field
+        if (resolved == null) {
+            for (Field f : BackendPlaySessionHandler.class.getDeclaredFields()) {
+                if (VelocityServerConnection.class.isAssignableFrom(f.getType())) {
+                    f.setAccessible(true);
+                    resolved = f;
+                    break;
+                }
+            }
+        }
+        if (resolved == null) {
+            throw new RuntimeException(
+                "VelocityScoreboardAPI: Could not find VelocityServerConnection field in " +
+                "BackendPlaySessionHandler. This Velocity build may have renamed internals — " +
+                "please report this at https://github.com/NEZNAMY/VelocityScoreboardAPI/issues"
+            );
+        }
+        serverConn = resolved;
+    }
+
+    /**
+     * Gets player from minecraft session handler.
+     *
+     * @param   handler
+     *          Handler to get player from
+     * @return  Player this handler belongs to
+     */
+    @NotNull
+    private static Player getPlayer(@NonNull MinecraftSessionHandler handler) {
+        try {
+            VelocityServerConnection connection = (VelocityServerConnection) serverConn.get(handler);
+            return connection.getPlayer();
+        } catch (IllegalAccessException e) {
+            throw new RuntimeException(e);
+        }
+    }
+    
+    private static DownstreamScoreboard getDownstream(@NonNull MinecraftSessionHandler handler) {
+        return ((VelocityScoreboardManager)ScoreboardManager.getInstance()).getBackendScoreboard(getPlayer(handler));
+    }
+
+    private static VelocityScoreboard getProxy(@NonNull MinecraftSessionHandler handler) {
+        return ((VelocityScoreboardManager)ScoreboardManager.getInstance()).getProxyScoreboard(getPlayer(handler));
+    }
+
+    /**
+     * Handles outgoing scoreboard packet.
+     *
+     * @param   handler
+     *          Handler that received the packet
+     * @param   packet
+     *          Received packet
+     * @return  {@code true} if packet should be cancelled, {@code false} if not
+     */
+    public static boolean handle(@NonNull MinecraftSessionHandler handler, @NonNull DisplayObjectivePacket packet) {
+        // Filter out invalid packets
+        if (getDownstream(handler).handle(packet)) return true;
+
+        if (getProxy(handler).getObjective(packet.getPosition()) != null) {
+            // This slot is occupied by proxy scoreboard, cancel packet
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Handles outgoing scoreboard packet.
+     *
+     * @param   handler
+     *          Handler that received the packet
+     * @param   packet
+     *          Received packet
+     * @return  {@code true} if packet should be cancelled, {@code false} if not
+     */
+    public static boolean handle(@NonNull MinecraftSessionHandler handler, @NonNull ObjectivePacket packet) {
+        // Filter out invalid packets
+        if (getDownstream(handler).handle(packet)) return true;
+
+        VelocityObjective objective = getProxy(handler).getObjective(packet.getObjectiveName());
+        if (objective != null) {
+            // Proxy already contains objective with this name, cancel everything
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Handles outgoing scoreboard packet.
+     *
+     * @param   handler
+     *          Handler that received the packet
+     * @param   packet
+     *          Received packet
+     * @return  {@code true} if packet should be cancelled, {@code false} if not
+     */
+    public static boolean handle(@NonNull MinecraftSessionHandler handler, @NonNull ScorePacket packet) {
+        // Filter out invalid packets
+        if (getDownstream(handler).handle(packet)) return true;
+
+        if (packet.getObjectiveName() == null) {
+            // Null objective removes from all objectives, add back what was set by proxy
+            for (ProxyObjective objective : getProxy(handler).getObjectives()) {
+                VelocityScore score = (VelocityScore) objective.getScore(packet.getScoreHolder());
+                if (score != null) score.sendUpdate();
+            }
+            return false;
+        } else {
+            VelocityObjective objective = getProxy(handler).getObjective(packet.getObjectiveName());
+            if (objective != null) {
+                // Proxy is occupying this objective, cancel packet
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Handles outgoing scoreboard packet.
+     *
+     * @param   handler
+     *          Handler that received the packet
+     * @param   packet
+     *          Received packet
+     * @return  {@code true} if packet should be cancelled, {@code false} if not
+     */
+    public static boolean handle(@NonNull MinecraftSessionHandler handler, @NonNull ScoreResetPacket packet) {
+        // Filter out invalid packets
+        if (getDownstream(handler).handle(packet)) return true;
+
+        if (packet.getObjectiveName() == null) {
+            // Null objective removes from all objectives, add back what was set by proxy
+            for (ProxyObjective objective : getProxy(handler).getObjectives()) {
+                VelocityScore score = (VelocityScore) objective.getScore(packet.getScoreHolder());
+                if (score != null) score.sendUpdate();
+            }
+            return false;
+        } else {
+            VelocityObjective objective = getProxy(handler).getObjective(packet.getObjectiveName());
+            if (objective != null) {
+                // Proxy is occupying this objective, cancel packet
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     *
+     * Handles outgoing scoreboard packet.
+     *
+     * @param   handler
+     *          Handler that received the packet
+     * @param   packet
+     *          Received packet
+     * @return  {@code true} if packet should be cancelled, {@code false} if not
+     */
+    public static boolean handle(@NonNull MinecraftSessionHandler handler, @NonNull ScoreSetPacket packet) {
+        // Filter out invalid packets
+        if (getDownstream(handler).handle(packet)) return true;
+
+        VelocityObjective objective = getProxy(handler).getObjective(packet.getObjectiveName());
+        if (objective != null) {
+            // Proxy is occupying this objective, cancel packet
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Handles outgoing scoreboard packet.
+     *
+     * @param   handler
+     *          Handler that received the packet
+     * @param   packet
+     *          Received packet
+     * @return  {@code true} if packet should be cancelled, {@code false} if not
+     */
+    public static boolean handle(@NonNull MinecraftSessionHandler handler, @NonNull TeamPacket packet) {
+        // Filter out invalid packets
+        if (getDownstream(handler).handle(packet)) return true;
+
+        VelocityTeam team = getProxy(handler).getTeam(packet.getName());
+        if (team != null) {
+            // Proxy is occupying this team, cancel packet
+            return true;
+        } else {
+            // Remove all entries occupied by a proxy team
+            if (packet.getEntries() != null) { // Any player action
+                for (VelocityTeam proxyTeam : getProxy(handler).getTeamsRaw()) {
+                    packet.getEntries().removeAll(proxyTeam.getEntryCollection());
+                }
+            }
+        }
+
+        return false;
+    }
+}
